@@ -1,0 +1,6 @@
+flask
+flask-cors
+oandapyV20
+pandas
+numpy
+requests
