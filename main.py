@@ -1,550 +1,439 @@
-"""
-ForexAI Bot 1 - EMA + RSI + Bollinger Bands + MACD Strategy
-Pairs: EUR/USD, GBP/USD, USD/JPY via OANDA API
-"""
-import os, time, logging, json, math
-from datetime import datetime, timezone, timedelta
+# ForexAI EMA Bot - v1.1 (fixed candle fetch)
+import os, time, logging, math
+from datetime import datetime, timezone
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-import requests as req_lib
-import pandas as pd
-import numpy as np
-import oandapyV20
-import oandapyV20.endpoints.accounts as accounts
-import oandapyV20.endpoints.orders as orders
-import oandapyV20.endpoints.trades as trades
-import oandapyV20.endpoints.positions as positions
-import oandapyV20.endpoints.instruments as instruments
-from oandapyV20.contrib.requests import MarketOrderRequest
-
+import threading
+ 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
-
-API_KEY     = os.getenv("OANDA_API_KEY", "")
-ACCOUNT_ID  = os.getenv("OANDA_ACCOUNT_ID", "")
-PAPER_MODE  = os.getenv("PAPER_MODE", "true").lower() == "true"
-ENVIRONMENT = "practice" if PAPER_MODE else "live"
-PAIRS       = ["EUR_USD", "GBP_USD", "USD_JPY"]
-STATE_FILE  = "/tmp/forex_ema_state.json"
-
-# Pip multipliers for P&L calculation
-PIP_MULT = {"EUR_USD": 10000, "GBP_USD": 10000, "USD_JPY": 100}
-
-STRATEGY = {
-    "ema_fast":         9,
-    "ema_slow":         21,
-    "ema_trend":        50,
-    "rsi_period":       14,
-    "rsi_oversold":     35,
-    "rsi_overbought":   65,
-    "bb_period":        20,
-    "bb_std":           2.0,
-    "bb_min_bandwidth": 0.05,   # % — forex moves in much smaller ranges than crypto
-    "stop_loss_pips":   15,     # pips
-    "take_profit_pips": 30,     # pips
-    "position_units":   10000,  # mini lot
-    "min_score":        4,
-    "cooldown_minutes": 15,
-    "enabled_regime_filter": True,
-}
-
-bot_state = {
-    "running":          True,
-    "killed":           False,
-    "positions":        {},
-    "closed_trades":    [],
-    "diary":            [],
-    "day_pnl":          0.0,
-    "total_trades":     0,
-    "win_count":        0,
-    "account_balance":  0.0,
-    "account_equity":   0.0,
-    "account_nav":      0.0,
-    "signals":          {},
-    "market_open":      False,
-    "cooldowns":        {},
-    "last_signal_data": {},
-}
-
-# ── Persistence ────────────────────────────────────────────────────────────────
-def save_state():
-    try:
-        with open(STATE_FILE, "w") as f:
-            json.dump({
-                "diary":         bot_state["diary"][-200:],
-                "closed_trades": bot_state["closed_trades"][-100:],
-                "day_pnl":       bot_state["day_pnl"],
-                "total_trades":  bot_state["total_trades"],
-                "win_count":     bot_state["win_count"],
-            }, f)
-    except Exception as e:
-        log.error(f"Save state error: {e}")
-
-def diary_entry(symbol, text, entry_type="trade"):
-    bot_state["diary"].append({
-        "time":   datetime.now().strftime("%H:%M"),
-        "symbol": symbol,
-        "text":   text,
-        "type":   entry_type,
-    })
-    save_state()
-
-# ── OANDA helpers ──────────────────────────────────────────────────────────────
-def get_oanda_client():
-    return oandapyV20.API(access_token=API_KEY, environment=ENVIRONMENT)
-
-def is_market_open():
-    """Forex market is open Sun 5PM ET to Fri 5PM ET."""
-    now = datetime.now(timezone.utc)
-    day = now.weekday()  # 0=Mon, 6=Sun
-    hour = now.hour
-    # Closed Saturday (5) and most of Sunday (6) until 21:00 UTC
-    if day == 5: return False
-    if day == 6 and hour < 21: return False
-    # Closed Friday after 21:00 UTC
-    if day == 4 and hour >= 21: return False
-    return True
-
-def get_account_data():
-    try:
-        client = get_oanda_client()
-        r = accounts.AccountSummary(ACCOUNT_ID)
-        client.request(r)
-        acc = r.response["account"]
-        bot_state["account_balance"] = float(acc.get("balance", 0))
-        bot_state["account_equity"]  = float(acc.get("NAV", 0))
-        bot_state["account_nav"]     = float(acc.get("NAV", 0))
-    except Exception as e:
-        log.error(f"Account fetch error: {e}")
-
-def get_open_trades():
-    try:
-        client = get_oanda_client()
-        r = trades.OpenTrades(ACCOUNT_ID)
-        client.request(r)
-        return r.response.get("trades", [])
-    except Exception as e:
-        log.error(f"Open trades error: {e}")
-        return []
-
-def sync_positions():
-    try:
-        open_trades = get_open_trades()
-        live_ids = set()
-        for t in open_trades:
-            inst = t["instrument"]
-            live_ids.add(inst)
-            if inst not in bot_state["positions"]:
-                bot_state["positions"][inst] = {
-                    "trade_id":   t["id"],
-                    "entry":      float(t["price"]),
-                    "units":      float(t["currentUnits"]),
-                    "open_time":  t.get("openTime", "")[:16].replace("T", " "),
-                    "symbol":     inst,
-                    "unrealized_pnl": float(t.get("unrealizedPL", 0)),
-                }
-            else:
-                bot_state["positions"][inst]["unrealized_pnl"] = float(t.get("unrealizedPL", 0))
-        for inst in list(bot_state["positions"].keys()):
-            if inst not in live_ids:
-                del bot_state["positions"][inst]
-    except Exception as e:
-        log.error(f"Position sync error: {e}")
-
-def get_candles(pair, count=100, granularity="M5"):
-    """Fetch OANDA candles with explicit time window."""
-    try:
-        client = get_oanda_client()
-        end   = datetime.now(timezone.utc)
-        start = end - timedelta(hours=12)
-        params = {
-            "count": count,
-            "granularity": granularity,
-            "price": "M",
-            "from": start.isoformat(),
-            "to":   end.isoformat(),
-        }
-        r = instruments.InstrumentsCandles(pair, params=params)
-        client.request(r)
-        candles = r.response.get("candles", [])
-        if not candles:
-            return None
-        data = []
-        for c in candles:
-            if c.get("complete", False):
-                mid = c["mid"]
-                data.append({
-                    "time":   c["time"],
-                    "open":   float(mid["o"]),
-                    "high":   float(mid["h"]),
-                    "low":    float(mid["l"]),
-                    "close":  float(mid["c"]),
-                    "volume": int(c.get("volume", 0)),
-                })
-        if not data:
-            return None
-        df = pd.DataFrame(data)
-        df["time"] = pd.to_datetime(df["time"])
-        df.set_index("time", inplace=True)
-        return df
-    except Exception as e:
-        log.error(f"Candles error {pair}: {e}")
-        return None
-
-def place_order(pair, units, sl_price, tp_price):
-    try:
-        client = get_oanda_client()
-        data = {
-            "order": {
-                "type":        "MARKET",
-                "instrument":  pair,
-                "units":       str(int(units)),
-                "timeInForce": "FOK",
-                "stopLossOnFill":   {"price": f"{sl_price:.5f}"},
-                "takeProfitOnFill": {"price": f"{tp_price:.5f}"},
-            }
-        }
-        r = orders.Orders(ACCOUNT_ID, data=data)
-        client.request(r)
-        return r.response
-    except Exception as e:
-        log.error(f"Order error {pair}: {e}")
-        return None
-
-def close_trade(trade_id):
-    try:
-        client = get_oanda_client()
-        r = trades.TradeClose(ACCOUNT_ID, tradeID=trade_id)
-        client.request(r)
-        return r.response
-    except Exception as e:
-        log.error(f"Close trade error {trade_id}: {e}")
-        return None
-
-# ── Indicators ─────────────────────────────────────────────────────────────────
-def compute_ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
-
-def compute_rsi(series, period=14):
-    delta = series.diff()
-    gain  = delta.clip(lower=0).rolling(period).mean()
-    loss  = (-delta.clip(upper=0)).rolling(period).mean()
-    rs    = gain / loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
-
-def compute_bollinger(series, period=20, std=2.0):
-    mid   = series.rolling(period).mean()
-    sigma = series.rolling(period).std()
-    upper = mid + std * sigma
-    lower = mid - std * sigma
-    bw    = ((upper - lower) / mid * 100).iloc[-1]
-    return upper, mid, lower, bw
-
-def compute_macd(series, fast=12, slow=26, signal=9):
-    ema_fast  = series.ewm(span=fast, adjust=False).mean()
-    ema_slow  = series.ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    sig_line  = macd_line.ewm(span=signal, adjust=False).mean()
-    return macd_line, sig_line, macd_line - sig_line
-
-def is_in_cooldown(pair):
-    cooldown_until = bot_state["cooldowns"].get(pair)
-    if cooldown_until and datetime.now() < cooldown_until:
-        remaining = (cooldown_until - datetime.now()).seconds // 60
-        log.info(f"{pair} in cooldown for {remaining} more minutes")
-        return True
-    return False
-
-def set_cooldown(pair):
-    bot_state["cooldowns"][pair] = datetime.now() + timedelta(minutes=STRATEGY["cooldown_minutes"])
-
-def is_signal_stale(pair, sig_data):
-    last = bot_state["last_signal_data"].get(pair)
-    if last is None:
-        bot_state["last_signal_data"][pair] = sig_data
-        return False
-    if (sig_data.get("rsi") == last.get("rsi") and
-        sig_data.get("macd_hist") == last.get("macd_hist")):
-        log.warning(f"{pair} — stale signal detected, skipping")
-        return True
-    bot_state["last_signal_data"][pair] = sig_data
-    return False
-
-# ── Signal generation ──────────────────────────────────────────────────────────
-def generate_signal(pair):
-    try:
-        df = get_candles(pair, count=100, granularity="M5")
-        if df is None or len(df) < 50:
-            return "HOLD", {}
-
-        close = df["close"]
-        price = float(close.iloc[-1])
-        pip   = 1 / PIP_MULT[pair]
-
-        ema_fast  = compute_ema(close, STRATEGY["ema_fast"])
-        ema_slow  = compute_ema(close, STRATEGY["ema_slow"])
-        ema_trend = compute_ema(close, STRATEGY["ema_trend"])
-
-        trend_bull = ema_fast.iloc[-1] > ema_slow.iloc[-1]
-        trend_prev = ema_fast.iloc[-2] > ema_slow.iloc[-2]
-        cross_up   = trend_bull and not trend_prev
-        cross_down = not trend_bull and trend_prev
-        above_50   = price > ema_trend.iloc[-1]
-
-        rsi      = compute_rsi(close, STRATEGY["rsi_period"])
-        rsi_val  = float(rsi.iloc[-1])
-
-        bb_up, bb_mid, bb_lo, bb_bw = compute_bollinger(close, STRATEGY["bb_period"], STRATEGY["bb_std"])
-        bb_buy  = price < float(bb_lo.iloc[-1]) and bb_bw >= STRATEGY["bb_min_bandwidth"]
-        bb_sell = price > float(bb_up.iloc[-1])
-
-        _, _, histogram = compute_macd(close)
-        macd_hist = float(histogram.iloc[-1])
-
-        buy_score = sell_score = 0
-        if trend_bull: buy_score  += 2
-        if cross_up:   buy_score  += 1
-        if not trend_bull: sell_score += 2
-        if cross_down: sell_score += 1
-        if rsi_val < STRATEGY["rsi_oversold"]:   buy_score  += 2
-        if rsi_val > STRATEGY["rsi_overbought"]: sell_score += 2
-        if bb_buy:  buy_score  += 1
-        if bb_sell: sell_score += 1
-        if macd_hist > 0: buy_score  += 1
-        if macd_hist < 0: sell_score += 1
-
-        sig_data = {
-            "price":     round(price, 5),
-            "rsi":       round(rsi_val, 1),
-            "bb_bw":     round(bb_bw, 4),
-            "macd_hist": round(macd_hist, 6),
-            "ema_trend": "BULL" if trend_bull else "BEAR",
-            "above_50":  bool(above_50),
-            "buy_score": buy_score,
-            "sell_score":sell_score,
-            "signal":    "HOLD",
-        }
-
-        log.info(f"{pair} | price={price:.5f} RSI={rsi_val:.1f} MACD={macd_hist:.6f} BB_BW={bb_bw:.4f} BUY={buy_score} SELL={sell_score}")
-
-        if buy_score >= STRATEGY["min_score"] and buy_score > sell_score and above_50:
-            return "BUY", {**sig_data, "signal": "BUY"}
-        elif sell_score >= STRATEGY["min_score"] and sell_score > buy_score:
-            return "SELL", {**sig_data, "signal": "SELL"}
-        return "HOLD", sig_data
-
-    except Exception as e:
-        log.error(f"Signal error {pair}: {e}")
-        return "HOLD", {"price": 0, "signal": "HOLD"}
-
-# ── Trading Loop ───────────────────────────────────────────────────────────────
-def trading_loop():
-    if not API_KEY or not ACCOUNT_ID:
-        log.warning("No OANDA credentials — bot idle")
-        return
-
-    if os.path.exists(STATE_FILE):
-        os.remove(STATE_FILE)
-        log.info("Cleared stale state")
-
-    get_account_data()
-    sync_positions()
-
-    log.info(f"ForexAI EMA Bot started | Paper={PAPER_MODE}")
-    diary_entry("SYSTEM",
-        f"ForexAI EMA Bot started | SL={STRATEGY['stop_loss_pips']}pips | "
-        f"TP={STRATEGY['take_profit_pips']}pips | "
-        f"Min score={STRATEGY['min_score']} | Cooldown={STRATEGY['cooldown_minutes']}min", "system")
-
-    while True:
-        try:
-            if bot_state["killed"]:
-                time.sleep(5)
-                continue
-
-            market_open = is_market_open()
-            bot_state["market_open"] = market_open
-
-            if not market_open:
-                log.info("Forex market closed — waiting")
-                time.sleep(300)
-                continue
-
-            get_account_data()
-            sync_positions()
-            now = datetime.now()
-
-            for pair in PAIRS:
-                signal, sig_data = generate_signal(pair)
-                bot_state["signals"][pair] = sig_data
-
-                in_position = pair in bot_state["positions"]
-
-                if in_position:
-                    pos = bot_state["positions"][pair]
-                    # OANDA handles SL/TP automatically — just check for manual exit signals
-                    pnl = pos.get("unrealized_pnl", 0)
-                    price = sig_data.get("price", pos["entry"])
-                    pips  = (price - pos["entry"]) * PIP_MULT[pair]
-
-                    # Manual exit on strong opposing signal
-                    if signal == "SELL" and pips > 5:
-                        result = close_trade(pos["trade_id"])
-                        if result:
-                            win = pnl > 0
-                            bot_state["closed_trades"].append({
-                                "symbol": pair, "entry": pos["entry"], "exit": price,
-                                "units": pos["units"], "pnl": round(pnl, 2),
-                                "pips": round(pips, 1), "win": win,
-                                "time": pos["open_time"],
-                                "close_time": now.strftime("%H:%M"),
-                                "signal": "Manual exit — SELL signal"
-                            })
-                            bot_state["day_pnl"]       = round(bot_state["day_pnl"] + pnl, 2)
-                            bot_state["total_trades"] += 1
-                            if win: bot_state["win_count"] += 1
-                            del bot_state["positions"][pair]
-                            diary_entry(pair,
-                                f"{'WIN' if win else 'LOSS'} | {pos['entry']:.5f} → {price:.5f} | "
-                                f"P&L ${pnl:.2f} | {pips:+.1f} pips | Manual exit",
-                                "win" if win else "loss")
-                            save_state()
-
-                elif signal == "BUY" and not bot_state["killed"]:
-                    if is_in_cooldown(pair):
-                        continue
-                    if is_signal_stale(pair, sig_data):
-                        continue
-
-                    price = sig_data.get("price", 0)
-                    if price <= 0:
-                        continue
-
-                    pip  = 1 / PIP_MULT[pair]
-                    sl   = round(price - STRATEGY["stop_loss_pips"] * pip, 5)
-                    tp   = round(price + STRATEGY["take_profit_pips"] * pip, 5)
-                    units = STRATEGY["position_units"]
-
-                    result = place_order(pair, units, sl, tp)
-                    if result:
-                        bot_state["positions"][pair] = {
-                            "trade_id":  result.get("orderFillTransaction", {}).get("tradeOpened", {}).get("tradeID", ""),
-                            "entry":     price,
-                            "units":     units,
-                            "open_time": now.strftime("%H:%M"),
-                            "symbol":    pair,
-                            "unrealized_pnl": 0,
-                            "sl": sl, "tp": tp,
-                        }
-                        diary_entry(pair,
-                            f"BUY | {price:.5f} | {units:,} units | "
-                            f"SL={sl:.5f} TP={tp:.5f} | "
-                            f"Score {sig_data.get('buy_score','?')} | RSI {sig_data.get('rsi','?')}",
-                            "trade")
-                        save_state()
-
-            time.sleep(60)
-
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            log.error(f"Loop error: {e}")
-            time.sleep(30)
-
-# ── JSON helper ────────────────────────────────────────────────────────────────
-def clean_nan(obj):
-    if obj is None: return None
-    if isinstance(obj, datetime): return obj.isoformat()
-    if hasattr(obj, '__module__') and type(obj).__module__ == 'numpy':
-        try: obj = obj.item()
-        except: return 0
-    if isinstance(obj, bool): return obj
-    if isinstance(obj, float):
-        return 0.0 if (math.isnan(obj) or math.isinf(obj)) else obj
-    if isinstance(obj, int): return obj
-    if isinstance(obj, str): return obj
-    if isinstance(obj, dict): return {str(k): clean_nan(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)): return [clean_nan(v) for v in obj]
-    try: return str(obj)
-    except: return None
-
-# ── Flask API ──────────────────────────────────────────────────────────────────
+ 
 app = Flask(__name__)
 CORS(app)
-
+ 
+OANDA_API_KEY    = os.environ.get("OANDA_API_KEY", "")
+OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "")
+PAPER_MODE       = os.environ.get("PAPER_MODE", "true").lower() == "true"
+OANDA_ENV        = "practice" if PAPER_MODE else "live"
+ 
+SYMBOLS = ["EUR_USD", "GBP_USD", "USD_JPY"]
+ 
+STRATEGY = {
+    "ema_fast": 9, "ema_slow": 21, "ema_trend": 50,
+    "rsi_period": 14, "rsi_oversold": 35, "rsi_overbought": 65,
+    "bb_period": 20, "bb_std": 2.0, "bb_min_bandwidth": 0.05,
+    "min_score": 4, "stop_loss_pips": 15, "take_profit_pips": 30,
+    "position_units": 10000, "cooldown_minutes": 15,
+    "enabled_regime_filter": True
+}
+ 
+bot_state = {
+    "running": True, "killed": False, "positions": {},
+    "closed_trades": [], "diary": [], "day_pnl": 0.0,
+    "total_trades": 0, "win_count": 0, "signals": {s: {} for s in SYMBOLS},
+    "account_balance": 0.0, "account_equity": 0.0, "account_nav": 0.0,
+    "active_cooldowns": {}, "market_open": False, "version": "ForexEMA-1.1"
+}
+ 
+def get_oanda_client():
+    import oandapyV20
+    return oandapyV20.API(access_token=OANDA_API_KEY, environment=OANDA_ENV)
+ 
+def get_candles(symbol, granularity="M5", count=100):
+    """Fetch candles using only count (no from/to conflict)"""
+    try:
+        import oandapyV20.endpoints.instruments as instruments
+        client = get_oanda_client()
+        params = {"granularity": granularity, "count": count, "price": "M"}
+        r = instruments.InstrumentsCandles(instrument=symbol, params=params)
+        client.request(r)
+        candles = r.response.get("candles", [])
+        result = []
+        for c in candles:
+            if c.get("complete", False):
+                m = c["mid"]
+                result.append({
+                    "time": c["time"],
+                    "open": float(m["o"]),
+                    "high": float(m["h"]),
+                    "low":  float(m["l"]),
+                    "close": float(m["c"]),
+                    "volume": int(c.get("volume", 0))
+                })
+        return result
+    except Exception as e:
+        log.error(f"Candles error {symbol}: {e}")
+        return []
+ 
+def calc_ema(prices, period):
+    if len(prices) < period:
+        return []
+    k = 2 / (period + 1)
+    ema = [sum(prices[:period]) / period]
+    for p in prices[period:]:
+        ema.append(p * k + ema[-1] * (1 - k))
+    return ema
+ 
+def calc_rsi(closes, period=14):
+    if len(closes) < period + 1:
+        return 50.0
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i-1]
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
+    ag = sum(gains[-period:]) / period
+    al = sum(losses[-period:]) / period
+    if al == 0:
+        return 100.0
+    rs = ag / al
+    return 100 - (100 / (1 + rs))
+ 
+def calc_bb(closes, period=20, std_dev=2.0):
+    if len(closes) < period:
+        return None, None, None
+    window = closes[-period:]
+    mid = sum(window) / period
+    variance = sum((x - mid) ** 2 for x in window) / period
+    std = math.sqrt(variance)
+    return mid - std_dev * std, mid, mid + std_dev * std
+ 
+def calc_macd(closes):
+    if len(closes) < 26:
+        return 0.0
+    ema12 = calc_ema(closes, 12)
+    ema26 = calc_ema(closes, 26)
+    if not ema12 or not ema26:
+        return 0.0
+    min_len = min(len(ema12), len(ema26))
+    macd_line = [ema12[-(min_len-i)] - ema26[-(min_len-i)] for i in range(min_len)]
+    signal = calc_ema(macd_line, 9)
+    if not signal:
+        return 0.0
+    return macd_line[-1] - signal[-1]
+ 
+def pip_value(symbol):
+    return 0.0001 if "JPY" not in symbol else 0.01
+ 
+def is_market_open():
+    now = datetime.now(timezone.utc)
+    wd = now.weekday()
+    h = now.hour + now.minute / 60
+    if wd == 4 and h >= 21:
+        return False
+    if wd == 5:
+        return False
+    if wd == 6 and h < 21:
+        return False
+    return True
+ 
+def get_account_info():
+    try:
+        import oandapyV20.endpoints.accounts as accounts
+        client = get_oanda_client()
+        r = accounts.AccountSummary(OANDA_ACCOUNT_ID)
+        client.request(r)
+        acct = r.response["account"]
+        bot_state["account_balance"] = float(acct.get("balance", 0))
+        bot_state["account_nav"]     = float(acct.get("NAV", 0))
+        bot_state["account_equity"]  = float(acct.get("NAV", 0))
+    except Exception as e:
+        log.error(f"Account info error: {e}")
+ 
+def sync_positions():
+    try:
+        import oandapyV20.endpoints.trades as trades
+        client = get_oanda_client()
+        r = trades.OpenTrades(OANDA_ACCOUNT_ID)
+        client.request(r)
+        open_trades = r.response.get("trades", [])
+        synced = {}
+        for t in open_trades:
+            sym = t["instrument"]
+            synced[sym] = {
+                "symbol": sym,
+                "entry": float(t["price"]),
+                "units": int(t["currentUnits"]),
+                "trade_id": t["id"],
+                "open_time": t.get("openTime", datetime.now(timezone.utc).isoformat()),
+                "current_price": float(t["price"]),
+                "unrealized_pnl": float(t.get("unrealizedPL", 0))
+            }
+        bot_state["positions"] = synced
+    except Exception as e:
+        log.error(f"Sync positions error: {e}")
+ 
+def place_order(symbol, units, side):
+    try:
+        import oandapyV20.endpoints.orders as orders
+        client = get_oanda_client()
+        actual_units = units if side == "BUY" else -units
+        data = {"order": {"type": "MARKET", "instrument": symbol, "units": str(actual_units)}}
+        r = orders.OrderCreate(OANDA_ACCOUNT_ID, data=data)
+        client.request(r)
+        fill = r.response.get("orderFillTransaction", {})
+        return float(fill.get("price", 0))
+    except Exception as e:
+        log.error(f"Order error {symbol}: {e}")
+        return None
+ 
+def close_position(symbol, trade_id):
+    try:
+        import oandapyV20.endpoints.trades as trades
+        client = get_oanda_client()
+        r = trades.TradeClose(OANDA_ACCOUNT_ID, trade_id)
+        client.request(r)
+        fill = r.response.get("orderFillTransaction", {})
+        return float(fill.get("price", 0))
+    except Exception as e:
+        log.error(f"Close position error {symbol}: {e}")
+        return None
+ 
+def add_diary(symbol, text, entry_type="info"):
+    entry = {"time": datetime.now(timezone.utc).strftime("%H:%M"), "symbol": symbol, "text": text, "type": entry_type}
+    bot_state["diary"].insert(0, entry)
+    if len(bot_state["diary"]) > 200:
+        bot_state["diary"] = bot_state["diary"][:200]
+ 
+def generate_signal(symbol):
+    try:
+        candles_5m = get_candles(symbol, "M5", 100)
+        candles_1h = get_candles(symbol, "H1", 60)
+        if len(candles_5m) < 30 or len(candles_1h) < 30:
+            return {}
+ 
+        closes_5m = [c["close"] for c in candles_5m]
+        closes_1h = [c["close"] for c in candles_1h]
+        price = closes_5m[-1]
+        pv = pip_value(symbol)
+ 
+        # EMAs
+        ema9  = calc_ema(closes_5m, 9)
+        ema21 = calc_ema(closes_5m, 21)
+        ema50 = calc_ema(closes_5m, 50)
+        ema50_1h = calc_ema(closes_1h, 50)
+ 
+        if not ema9 or not ema21 or not ema50 or not ema50_1h:
+            return {}
+ 
+        rsi = calc_rsi(closes_5m)
+        bb_low, bb_mid, bb_high = calc_bb(closes_5m)
+        macd_h = calc_macd(closes_5m)
+ 
+        if bb_mid is None:
+            return {}
+ 
+        bb_bw = ((bb_high - bb_low) / bb_mid) if bb_mid > 0 else 0
+ 
+        buy_score = 0
+        sell_score = 0
+ 
+        # Trend filter (1H 50 EMA)
+        regime_ok = price > ema50_1h[-1]
+ 
+        # EMA signals
+        if ema9[-1] > ema21[-1]:
+            buy_score += 2
+        else:
+            sell_score += 2
+ 
+        # Fresh crossover
+        if len(ema9) > 1 and len(ema21) > 1:
+            if ema9[-1] > ema21[-1] and ema9[-2] <= ema21[-2]:
+                buy_score += 1
+            elif ema9[-1] < ema21[-1] and ema9[-2] >= ema21[-2]:
+                sell_score += 1
+ 
+        # RSI
+        if rsi < STRATEGY["rsi_oversold"]:
+            buy_score += 2
+        elif rsi > STRATEGY["rsi_overbought"]:
+            sell_score += 2
+ 
+        # Bollinger Bands
+        if bb_bw >= STRATEGY["bb_min_bandwidth"]:
+            if price < bb_low:
+                buy_score += 1
+            elif price > bb_high:
+                sell_score += 1
+ 
+        # MACD
+        if macd_h > 0:
+            buy_score += 1
+        else:
+            sell_score += 1
+ 
+        return {
+            "price": price, "rsi": round(rsi, 1), "macd_h": round(macd_h / pv, 2),
+            "bb_bw": round(bb_bw * 100, 2), "buy_score": buy_score, "sell_score": sell_score,
+            "ema9": round(ema9[-1], 5), "ema21": round(ema21[-1], 5),
+            "ema50_1h": round(ema50_1h[-1], 5), "regime_ok": regime_ok
+        }
+    except Exception as e:
+        log.error(f"Signal error {symbol}: {e}")
+        return {}
+ 
+def trading_loop():
+    add_diary("SYSTEM", f"ForexAI EMA Bot started | SL=15pips | TP=30pips | Min score=4 | Cooldown=15min", "system")
+    log.info("ForexAI EMA Bot v1.1 started")
+ 
+    while True:
+        try:
+            if not is_market_open():
+                bot_state["market_open"] = False
+                time.sleep(60)
+                continue
+ 
+            bot_state["market_open"] = True
+            get_account_info()
+            sync_positions()
+ 
+            now = datetime.now(timezone.utc)
+ 
+            # Clear expired cooldowns
+            expired = [s for s, t in bot_state["active_cooldowns"].items()
+                       if (now - datetime.fromisoformat(t)).total_seconds() > STRATEGY["cooldown_minutes"] * 60]
+            for s in expired:
+                del bot_state["active_cooldowns"][s]
+ 
+            for symbol in SYMBOLS:
+                if bot_state["killed"]:
+                    break
+ 
+                sig = generate_signal(symbol)
+                bot_state["signals"][symbol] = sig
+ 
+                if not sig:
+                    continue
+ 
+                pv = pip_value(symbol)
+                sl_price_delta = STRATEGY["stop_loss_pips"] * pv
+                tp_price_delta = STRATEGY["take_profit_pips"] * pv
+ 
+                log.info(f"{symbol} | price={sig['price']} RSI={sig['rsi']} BUY={sig['buy_score']} SELL={sig['sell_score']} regime={'OK' if sig.get('regime_ok') else 'BEAR'}")
+ 
+                # Check exits for open positions
+                if symbol in bot_state["positions"]:
+                    pos = bot_state["positions"][symbol]
+                    entry = pos["entry"]
+                    trade_id = pos["trade_id"]
+                    pnl_pips = (sig["price"] - entry) / pv
+ 
+                    should_exit = False
+                    reason = ""
+ 
+                    if pnl_pips >= STRATEGY["take_profit_pips"]:
+                        should_exit = True
+                        reason = "Take profit"
+                    elif pnl_pips <= -STRATEGY["stop_loss_pips"]:
+                        should_exit = True
+                        reason = "Stop loss"
+                        bot_state["active_cooldowns"][symbol] = now.isoformat()
+                    elif sig["sell_score"] >= STRATEGY["min_score"] and sig["buy_score"] < sig["sell_score"]:
+                        should_exit = True
+                        reason = "SELL signal"
+ 
+                    if should_exit:
+                        exit_price = close_position(symbol, trade_id)
+                        if exit_price:
+                            pnl = (exit_price - entry) * pos["units"]
+                            win = pnl > 0
+                            bot_state["day_pnl"] += pnl
+                            bot_state["total_trades"] += 1
+                            if win:
+                                bot_state["win_count"] += 1
+                            trade_rec = {
+                                "symbol": symbol, "entry": entry, "exit": exit_price,
+                                "pnl": round(pnl, 2), "pips": round(pnl_pips, 1),
+                                "win": win, "reason": reason,
+                                "time": now.strftime("%H:%M")
+                            }
+                            bot_state["closed_trades"].append(trade_rec)
+                            entry_type = "win" if win else "loss"
+                            add_diary(symbol, f"{'WIN' if win else 'LOSS'} | {entry:.5f} -> {exit_price:.5f} | {round(pnl_pips,1)} pips | P&L ${round(pnl,2)} | {reason}", entry_type)
+                            del bot_state["positions"][symbol]
+ 
+                # Check entries
+                elif symbol not in bot_state["active_cooldowns"] and not bot_state["killed"]:
+                    regime_ok = sig.get("regime_ok", True) or not STRATEGY["enabled_regime_filter"]
+                    if sig["buy_score"] >= STRATEGY["min_score"] and sig["buy_score"] > sig["sell_score"] and regime_ok:
+                        entry_price = place_order(symbol, STRATEGY["position_units"], "BUY")
+                        if entry_price:
+                            bot_state["positions"][symbol] = {
+                                "symbol": symbol, "entry": entry_price,
+                                "units": STRATEGY["position_units"], "trade_id": "pending",
+                                "open_time": now.isoformat(), "current_price": entry_price,
+                                "unrealized_pnl": 0
+                            }
+                            sync_positions()
+                            add_diary(symbol, f"BUY | Entry {entry_price:.5f} | Score {sig['buy_score']} | RSI {sig['rsi']}", "buy")
+ 
+        except Exception as e:
+            log.error(f"Loop error: {e}")
+ 
+        time.sleep(60)
+ 
+threading.Thread(target=trading_loop, daemon=True).start()
+ 
 @app.after_request
-def add_no_cache(response):
-    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-    response.headers["Pragma"]        = "no-cache"
-    response.headers["Expires"]       = "0"
-    return response
-
-@app.route("/status")
-def status():
-    get_account_data()
-    sync_positions()
-    wins  = bot_state["win_count"]
-    total = bot_state["total_trades"]
-    payload = {
-        "running":          bot_state["running"],
-        "killed":           bot_state["killed"],
-        "paper_mode":       PAPER_MODE,
-        "market_open":      bot_state["market_open"],
-        "positions":        bot_state["positions"],
-        "closed_trades":    bot_state["closed_trades"][-50:],
-        "diary":            bot_state["diary"][-100:],
-        "day_pnl":          bot_state["day_pnl"],
-        "total_trades":     total,
-        "win_rate":         round(wins/total*100) if total > 0 else 0,
-        "strategy":         STRATEGY,
-        "signals":          bot_state["signals"],
-        "account_balance":  bot_state["account_balance"],
-        "account_equity":   bot_state["account_equity"],
-        "account_nav":      bot_state["account_nav"],
-        "active_cooldowns": {k: v.isoformat() for k, v in bot_state.get("cooldowns", {}).items()
-                             if isinstance(v, datetime) and v > datetime.now()},
-        "version":          "ForexEMA-1.0",
-    }
-    return jsonify(clean_nan(payload))
-
-@app.route("/killswitch", methods=["POST"])
-def killswitch():
-    data = request.json or {}
-    bot_state["killed"] = data.get("kill", True)
-    status_str = "KILLED" if bot_state["killed"] else "RESUMED"
-    diary_entry("SYSTEM", f"Kill switch {status_str}", "system")
-    return jsonify({"killed": bot_state["killed"], "status": status_str})
-
-@app.route("/settings", methods=["POST"])
-def update_settings():
-    data    = request.json or {}
-    allowed = ["stop_loss_pips","take_profit_pips","position_units",
-               "min_score","cooldown_minutes","rsi_oversold","rsi_overbought"]
-    for k in allowed:
-        if k in data:
-            STRATEGY[k] = data[k]
-    diary_entry("SYSTEM", "Settings updated", "system")
-    return jsonify({"ok": True, "strategy": STRATEGY})
-
-@app.route("/diary")
-def get_diary():
-    return jsonify({"diary": bot_state["diary"]})
-
+def no_cache(r):
+    r.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    r.headers["Pragma"] = "no-cache"
+    return r
+ 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "time": datetime.now().isoformat(),
-                    "version": "ForexEMA-1.0", "market_open": is_market_open()})
-
+    return jsonify({"status": "ok", "time": datetime.now(timezone.utc).isoformat(),
+                    "version": bot_state["version"], "market_open": bot_state["market_open"]})
+ 
+@app.route("/status")
+def status():
+    get_account_info()
+    wins = bot_state["win_count"]
+    total = bot_state["total_trades"]
+    return jsonify({
+        "running": bot_state["running"], "killed": bot_state["killed"],
+        "paper_mode": PAPER_MODE, "market_open": bot_state["market_open"],
+        "positions": bot_state["positions"], "closed_trades": bot_state["closed_trades"][-50:],
+        "diary": bot_state["diary"][-100:], "day_pnl": bot_state["day_pnl"],
+        "total_trades": total, "win_rate": round(wins/total*100) if total > 0 else 0,
+        "signals": bot_state["signals"], "strategy": STRATEGY,
+        "account_balance": bot_state["account_balance"],
+        "account_equity": bot_state["account_equity"],
+        "account_nav": bot_state["account_nav"],
+        "active_cooldowns": bot_state["active_cooldowns"],
+        "version": bot_state["version"]
+    })
+ 
+@app.route("/diary")
+def diary():
+    return jsonify({"diary": bot_state["diary"]})
+ 
+@app.route("/kill", methods=["POST"])
+def kill():
+    bot_state["killed"] = not bot_state["killed"]
+    status = "KILLED" if bot_state["killed"] else "RESUMED"
+    add_diary("SYSTEM", f"Kill switch {status}", "system")
+    return jsonify({"killed": bot_state["killed"]})
+ 
+@app.route("/bars")
+def bars():
+    symbol = request.args.get("symbol", "EUR_USD")
+    tf = request.args.get("timeframe", "M5")
+    candles = get_candles(symbol, tf, 150)
+    result = [{"time": int(datetime.fromisoformat(c["time"].replace("Z","")).timestamp()),
+               "open": c["open"], "high": c["high"], "low": c["low"], "close": c["close"]} for c in candles]
+    return jsonify(result)
+ 
 @app.route("/")
 def index():
     try:
-        return open("/app/index.html").read()
-    except Exception:
-        return open("index.html").read()
-
+        with open("index.html") as f:
+            return f.read()
+    except:
+        return jsonify({"status": "ForexAI EMA Bot v1.1 running"})
+ 
 if __name__ == "__main__":
-    import threading
-    t = threading.Thread(target=trading_loop, daemon=True)
-    t.start()
-    port = int(os.getenv("PORT", 8080))
+    port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+ 
