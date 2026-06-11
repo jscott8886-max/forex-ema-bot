@@ -32,7 +32,7 @@ bot_state = {
     "closed_trades": [], "diary": [], "day_pnl": 0.0,
     "total_trades": 0, "win_count": 0, "signals": {s: {} for s in SYMBOLS},
     "account_balance": 0.0, "account_equity": 0.0, "account_nav": 0.0,
-    "active_cooldowns": {}, "market_open": False, "version": "ForexEMA-1.1"
+    "active_cooldowns": {}, "market_open": False, "version": "ForexEMA-1.2"
 }
  
 def get_oanda_client():
@@ -275,7 +275,7 @@ def generate_signal(symbol):
  
 def trading_loop():
     add_diary("SYSTEM", f"ForexAI EMA Bot started | SL=15pips | TP=30pips | Min score=4 | Cooldown=15min", "system")
-    log.info("ForexAI EMA Bot v1.1 started")
+    log.info("ForexAI EMA Bot v1.2 started")
  
     while True:
         try:
@@ -330,13 +330,28 @@ def trading_loop():
                         reason = "Stop loss"
                         bot_state["active_cooldowns"][symbol] = now.isoformat()
                     elif sig["sell_score"] >= STRATEGY["min_score"] and sig["buy_score"] < sig["sell_score"]:
-                        should_exit = True
-                        reason = "SELL signal"
+                        # Only exit on signal if we've made at least 10 pips profit
+                        # This prevents cutting wins short on minor signal fluctuations
+                        if pnl_pips >= 10:
+                            should_exit = True
+                            reason = "SELL signal"
+                        elif pnl_pips < 0:
+                            # Allow signal exit at a loss only if loss is more than 5 pips
+                            # to avoid exiting on noise
+                            if pnl_pips <= -5:
+                                should_exit = True
+                                reason = "SELL signal"
  
                     if should_exit:
                         exit_price = close_position(symbol, trade_id)
                         if exit_price:
-                            pnl = (exit_price - entry) * pos["units"]
+                            # Correct P&L calculation per currency pair:
+                            # EUR/USD, GBP/USD: pnl = (exit - entry) * units (already in USD)
+                            # USD/JPY: pnl = (exit - entry) * units / exit_price (convert JPY to USD)
+                            if "JPY" in symbol:
+                                pnl = (exit_price - entry) * pos["units"] / exit_price
+                            else:
+                                pnl = (exit_price - entry) * pos["units"]
                             win = pnl > 0
                             bot_state["day_pnl"] += pnl
                             bot_state["total_trades"] += 1
@@ -431,9 +446,8 @@ def index():
         with open("index.html") as f:
             return f.read()
     except:
-        return jsonify({"status": "ForexAI EMA Bot v1.1 running"})
+        return jsonify({"status": "ForexAI EMA Bot v1.2 running"})
  
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
- 
